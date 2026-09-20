@@ -113,6 +113,7 @@ export function useConfigState(options?: UseConfigStateOptions) {
 		'low' | 'medium' | 'high'
 	>('medium');
 	const [responsesFastMode, setResponsesFastMode] = useState(false);
+	const [responsesWebSocket, setResponsesWebSocket] = useState(false);
 	const [anthropicSpeed, setAnthropicSpeed] = useState<
 		'fast' | 'standard' | undefined
 	>(undefined);
@@ -217,6 +218,10 @@ export function useConfigState(options?: UseConfigStateOptions) {
 						'baseUrlMode',
 						'apiKey',
 						'requestMethod',
+						// WebSocket 开关只对 Responses 请求方案有意义
+						...(requestMethod === 'responses'
+							? ['responsesWebSocket' as ConfigField]
+							: []),
 				  ] as ConfigField[])
 				: []),
 			'promptHeadersGroup',
@@ -360,6 +365,13 @@ export function useConfigState(options?: UseConfigStateOptions) {
 		) {
 			setCurrentField('reasoningGroup');
 		}
+		// WebSocket 开关归属 API 连接分组，切走 Responses 方案时回退到该分组
+		if (
+			requestMethod !== 'responses' &&
+			currentField === 'responsesWebSocket'
+		) {
+			setCurrentField('apiConnectionGroup');
+		}
 		if (
 			requestMethod !== 'chat' &&
 			(currentField === 'chatThinkingEnabled' ||
@@ -458,6 +470,7 @@ export function useConfigState(options?: UseConfigStateOptions) {
 		);
 		setResponsesVerbosity(config.responsesVerbosity || 'medium');
 		setResponsesFastMode(config.responsesFastMode || false);
+		setResponsesWebSocket(config.responsesWebSocket || false);
 		setAnthropicSpeed(config.anthropicSpeed);
 		setChatThinkingEnabled(config.chatThinking?.enabled || false);
 		setChatReasoningEffort(config.chatThinking?.reasoning_effort || 'high');
@@ -948,6 +961,7 @@ export function useConfigState(options?: UseConfigStateOptions) {
 			};
 
 			config.responsesFastMode = responsesFastMode;
+			config.responsesWebSocket = responsesWebSocket;
 			config.responsesVerbosity = responsesVerbosity;
 			config.anthropicSpeed = anthropicSpeed;
 
@@ -1000,6 +1014,7 @@ export function useConfigState(options?: UseConfigStateOptions) {
 						},
 						responsesVerbosity,
 						responsesFastMode,
+						responsesWebSocket,
 						anthropicSpeed,
 						chatThinking: chatThinkingEnabled
 							? {enabled: true, reasoning_effort: chatReasoningEffort}
@@ -1105,6 +1120,8 @@ export function useConfigState(options?: UseConfigStateOptions) {
 		setResponsesVerbosity,
 		responsesFastMode,
 		setResponsesFastMode,
+		responsesWebSocket,
+		setResponsesWebSocket,
 		anthropicSpeed,
 		setAnthropicSpeed,
 		chatThinkingEnabled,

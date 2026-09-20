@@ -361,6 +361,7 @@ export const en: TranslationKeys = {
 		responsesReasoningModeNone: 'None',
 		responsesVerbosity: 'Responses Verbosity:',
 		responsesFastMode: 'Responses Fast Mode (priority):',
+		responsesWebSocket: 'Responses WebSocket Mode:',
 		chatThinkingEnabled: 'Chat Thinking (DeepSeek):',
 		chatReasoningEffort: 'Chat Reasoning Effort:',
 		advancedModel: 'Advanced Model(Type to search):',

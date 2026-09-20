@@ -336,6 +336,7 @@ export const zh: TranslationKeys = {
 		responsesReasoningModeNone: '无',
 		responsesVerbosity: 'Responses 输出详细度:',
 		responsesFastMode: 'Responses Fast (priority):',
+		responsesWebSocket: 'Responses WebSocket 模式:',
 		chatThinkingEnabled: '启用 Chat 思考 (DeepSeek):',
 		chatReasoningEffort: 'Chat 思考强度:',
 		advancedModel: '高级模型(键入可搜索):',

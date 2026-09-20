@@ -24,6 +24,7 @@ import {addProxyToFetchOptions} from '../utils/core/proxyUtils.js';
 import {saveUsageToFile} from '../utils/core/usageLogger.js';
 import {getVersionHeader} from '../utils/core/version.js';
 import {resolveApiEndpoint} from './endpointResolver.js';
+import {streamResponsesWebSocket} from './responsesWebSocket.js';
 import {
 	endChatSpan,
 	recordChatContent,
@@ -578,6 +579,238 @@ async function* parseSSEStream(
 }
 
 /**
+ * Responses 事件处理的增量状态（HTTP SSE 与 WebSocket 共用）。
+ */
+interface ResponsesEventState {
+	contentBuffer: string;
+	toolCallsBuffer: {[callId: string]: any};
+	hasToolCalls: boolean;
+	currentFunctionCallId: string | null;
+	usageData: UsageInfo | undefined;
+	reasoningData:
+		| {
+				summary?: Array<{text: string; type: 'summary_text'}>;
+				content?: any;
+				encrypted_content?: string;
+		  }
+		| undefined;
+	/** 是否已收到终止事件（response.completed / failed / cancelled） */
+	completed: boolean;
+}
+
+function createResponsesEventState(): ResponsesEventState {
+	return {
+		contentBuffer: '',
+		toolCallsBuffer: {},
+		hasToolCalls: false,
+		currentFunctionCallId: null,
+		usageData: undefined,
+		reasoningData: undefined,
+		completed: false,
+	};
+}
+
+/**
+ * 处理单个 Responses 事件，返回需要向上层产出的事件列表。
+ * HTTP SSE 与 WebSocket 推送的事件语义完全一致，因此共用此函数。
+ */
+function handleResponsesEvent(
+	state: ResponsesEventState,
+	chunk: any,
+): ResponseStreamChunk[] {
+	const output: ResponseStreamChunk[] = [];
+
+	// Responses API 使用事件对象格式
+	const eventType = chunk.type;
+
+	// 根据事件类型处理
+	if (
+		eventType === 'response.created' ||
+		eventType === 'response.in_progress'
+	) {
+		// 响应创建/进行中 - 忽略
+		return output;
+	} else if (eventType === 'response.output_item.added') {
+		// 新输出项添加
+		const item = chunk.item;
+		if (item?.type === 'reasoning') {
+			// 推理摘要开始 - 发送 reasoning_started 事件
+			output.push({type: 'reasoning_started'});
+			return output;
+		} else if (item?.type === 'message') {
+			// 消息开始 - 忽略
+			return output;
+		} else if (item?.type === 'function_call') {
+			// 工具调用开始
+			state.hasToolCalls = true;
+			const callId = item.call_id || item.id;
+			state.currentFunctionCallId = callId;
+			state.toolCallsBuffer[callId] = {
+				id: callId,
+				type: 'function',
+				function: {
+					name: item.name || '',
+					arguments: '',
+				},
+			};
+			return output;
+		}
+		return output;
+	} else if (eventType === 'response.function_call_arguments.delta') {
+		// 工具调用参数增量
+		const delta = chunk.delta;
+		if (delta && state.currentFunctionCallId) {
+			state.toolCallsBuffer[state.currentFunctionCallId].function.arguments +=
+				delta;
+			// 发送 delta 用于 token 计数
+			output.push({type: 'tool_call_delta', delta});
+		}
+	} else if (eventType === 'response.function_call_arguments.done') {
+		// 工具调用参数完成
+		const itemId = chunk.item_id;
+		const args = chunk.arguments;
+		if (itemId && state.toolCallsBuffer[itemId]) {
+			state.toolCallsBuffer[itemId].function.arguments = args;
+		}
+		state.currentFunctionCallId = null;
+		return output;
+	} else if (eventType === 'response.output_item.done') {
+		// 输出项完成
+		const item = chunk.item;
+		if (item?.type === 'function_call') {
+			// 确保工具调用信息完整
+			const callId = item.call_id || item.id;
+			if (state.toolCallsBuffer[callId]) {
+				state.toolCallsBuffer[callId].function.name = item.name;
+				state.toolCallsBuffer[callId].function.arguments = item.arguments;
+			}
+		} else if (item?.type === 'reasoning') {
+			// 捕获完整的 reasoning 对象（包括 encrypted_content）
+			state.reasoningData = {
+				summary: item.summary,
+				content: item.content,
+				encrypted_content: item.encrypted_content,
+			};
+		}
+		return output;
+	} else if (eventType === 'response.content_part.added') {
+		// 内容部分添加 - 忽略
+		return output;
+	} else if (
+		eventType === 'response.reasoning_summary_text.delta' ||
+		// DeepSeek 兼容 Responses API 的思考流事件
+		eventType === 'response.reasoning_text.delta'
+	) {
+		// 推理摘要/思考流增量更新（仅用于 token 计数，不包含在响应内容中）
+		const delta = chunk.delta;
+		if (delta) {
+			output.push({type: 'reasoning_delta', delta});
+		}
+	} else if (eventType === 'response.output_text.delta') {
+		// 文本增量更新
+		const delta = chunk.delta;
+		if (delta) {
+			state.contentBuffer += delta;
+			output.push({type: 'content', content: delta});
+		}
+	} else if (eventType === 'response.output_text.done') {
+		// 文本输出完成 - 忽略
+		return output;
+	} else if (eventType === 'response.content_part.done') {
+		// 内容部分完成 - 忽略
+		return output;
+	} else if (eventType === 'response.completed') {
+		// 响应完全完成 - 从 response 对象中提取 usage
+		if (chunk.response && chunk.response.usage) {
+			state.usageData = {
+				prompt_tokens: chunk.response.usage.input_tokens || 0,
+				completion_tokens: chunk.response.usage.output_tokens || 0,
+				total_tokens: chunk.response.usage.total_tokens || 0,
+				// OpenAI Responses API: cached_tokens in input_tokens_details (note: tokenS)
+				cached_tokens: (chunk.response.usage as any).input_tokens_details
+					?.cached_tokens,
+			};
+		}
+		state.completed = true;
+		return output;
+	} else if (
+		eventType === 'response.failed' ||
+		eventType === 'response.cancelled'
+	) {
+		// 响应失败或取消
+		const error = chunk.error;
+		if (error) {
+			const responseErrorMessage = error.message || 'Unknown error';
+			throw new Error(`Response failed: ${responseErrorMessage}`);
+		}
+		state.completed = true;
+		return output;
+	} else if (eventType === 'error') {
+		// WebSocket 模式下的请求级错误事件
+		const error = chunk.error;
+		const errorMessage =
+			error?.message || chunk.message || 'Unknown WebSocket error';
+		throw new Error(`Response failed: ${errorMessage}`);
+	}
+
+	return output;
+}
+
+/**
+ * 流结束后统一产出工具调用、推理内容、用量与完成信号。
+ */
+function* finalizeResponsesStream(
+	state: ResponsesEventState,
+	options: ResponseOptions,
+	telemetry: ReturnType<typeof startChatSpan>,
+): Generator<ResponseStreamChunk, void, unknown> {
+	if (state.hasToolCalls) {
+		yield {
+			type: 'tool_calls',
+			tool_calls: Object.values(state.toolCallsBuffer),
+		};
+	}
+
+	// Yield reasoning data if available
+	if (state.reasoningData) {
+		yield {
+			type: 'reasoning_data',
+			reasoning: state.reasoningData,
+		};
+	}
+
+	// Yield usage information if available
+	if (state.usageData) {
+		// Save usage to file system at API layer
+		saveUsageToFile(options.model, state.usageData);
+		recordChatUsage(
+			state.usageData,
+			telemetry.metricAttributes,
+			telemetry.span,
+		);
+
+		yield {
+			type: 'usage',
+			usage: state.usageData,
+		};
+	}
+
+	if (state.contentBuffer) {
+		recordChatContent(
+			telemetry.span,
+			'response',
+			state.contentBuffer,
+			telemetry.metricAttributes,
+		);
+	}
+
+	// 发送完成信号 - For Responses API, thinking content is in reasoning object, not separate thinking field
+	yield {
+		type: 'done',
+	};
+}
+
+/**
  * 使用 Responses API 创建流式响应（带自动工具调用）
  */
 export async function* createStreamingResponse(
@@ -710,18 +943,47 @@ export async function* createStreamingResponse(
 					{sessionId: options.sessionId ?? options.prompt_cache_key},
 				);
 
+				const requestHeaders = {
+					'Content-Type': 'application/json',
+					Authorization: `Bearer ${config.apiKey}`,
+					'x-snow': getVersionHeader(),
+					...(options.prompt_cache_key && {
+						conversation_id: options.prompt_cache_key,
+						session_id: options.prompt_cache_key,
+					}),
+					...customHeaders,
+				};
+
+				const idleTimeoutMs = (config.streamIdleTimeoutSec ?? 180) * 1000;
+
+				// WebSocket 模式：用长连接替代 HTTP + SSE，服务端事件结构与 SSE 完全一致，
+				// 因此事件处理与收尾逻辑与 SSE 分支共用。
+				if (config.responsesWebSocket) {
+					const wsEventState = createResponsesEventState();
+
+					for await (const chunk of streamResponsesWebSocket({
+						endpoint: url,
+						headers: requestHeaders,
+						payload: requestPayload,
+						abortSignal,
+						idleTimeoutMs,
+					})) {
+						for (const event of handleResponsesEvent(wsEventState, chunk)) {
+							yield event;
+						}
+
+						if (wsEventState.completed) {
+							break;
+						}
+					}
+
+					yield* finalizeResponsesStream(wsEventState, options, telemetry);
+					return;
+				}
+
 				const fetchOptions = addProxyToFetchOptions(url, {
 					method: 'POST',
-					headers: {
-						'Content-Type': 'application/json',
-						Authorization: `Bearer ${config.apiKey}`,
-						'x-snow': getVersionHeader(),
-						...(options.prompt_cache_key && {
-							conversation_id: options.prompt_cache_key,
-							session_id: options.prompt_cache_key,
-						}),
-						...customHeaders,
-					},
+					headers: requestHeaders,
 					body: JSON.stringify(requestPayload),
 					signal: abortSignal,
 				});
@@ -757,19 +1019,7 @@ export async function* createStreamingResponse(
 					throw new Error('No response body from OpenAI Responses API');
 				}
 
-				let contentBuffer = '';
-				let toolCallsBuffer: {[call_id: string]: any} = {};
-				let hasToolCalls = false;
-				let currentFunctionCallId: string | null = null;
-				let usageData: UsageInfo | undefined;
-				let reasoningData:
-					| {
-							summary?: Array<{text: string; type: 'summary_text'}>;
-							content?: any;
-							encrypted_content?: string;
-					  }
-					| undefined;
-				const idleTimeoutMs = (config.streamIdleTimeoutSec ?? 180) * 1000;
+				const eventState = createResponsesEventState();
 
 				for await (const chunk of parseSSEStream(
 					response.body.getReader(),
@@ -778,188 +1028,18 @@ export async function* createStreamingResponse(
 				)) {
 					// abort 由 parseSSEStream 统一处理,避免重复分支导致行为漂移
 
-					// Responses API 使用 SSE 事件格式
-					const eventType = chunk.type;
+					// Responses API 的 SSE 事件与 WebSocket 事件结构一致，共用同一处理函数
+					for (const event of handleResponsesEvent(eventState, chunk)) {
+						yield event;
+					}
 
-					// 根据事件类型处理
-					if (
-						eventType === 'response.created' ||
-						eventType === 'response.in_progress'
-					) {
-						// 响应创建/进行中 - 忽略
-						continue;
-					} else if (eventType === 'response.output_item.added') {
-						// 新输出项添加
-						const item = chunk.item;
-						if (item?.type === 'reasoning') {
-							// 推理摘要开始 - 发送 reasoning_started 事件
-							yield {
-								type: 'reasoning_started',
-							};
-							continue;
-						} else if (item?.type === 'message') {
-							// 消息开始 - 忽略
-							continue;
-						} else if (item?.type === 'function_call') {
-							// 工具调用开始
-							hasToolCalls = true;
-							const callId = item.call_id || item.id;
-							currentFunctionCallId = callId;
-							toolCallsBuffer[callId] = {
-								id: callId,
-								type: 'function',
-								function: {
-									name: item.name || '',
-									arguments: '',
-								},
-							};
-							continue;
-						}
-						continue;
-					} else if (eventType === 'response.function_call_arguments.delta') {
-						// 工具调用参数增量
-						const delta = chunk.delta;
-						if (delta && currentFunctionCallId) {
-							toolCallsBuffer[currentFunctionCallId].function.arguments +=
-								delta;
-							// 发送 delta 用于 token 计数
-							yield {
-								type: 'tool_call_delta',
-								delta: delta,
-							};
-						}
-					} else if (eventType === 'response.function_call_arguments.done') {
-						// 工具调用参数完成
-						const itemId = chunk.item_id;
-						const args = chunk.arguments;
-						if (itemId && toolCallsBuffer[itemId]) {
-							toolCallsBuffer[itemId].function.arguments = args;
-						}
-						currentFunctionCallId = null;
-						continue;
-					} else if (eventType === 'response.output_item.done') {
-						// 输出项完成
-						const item = chunk.item;
-						if (item?.type === 'function_call') {
-							// 确保工具调用信息完整
-							const callId = item.call_id || item.id;
-							if (toolCallsBuffer[callId]) {
-								toolCallsBuffer[callId].function.name = item.name;
-								toolCallsBuffer[callId].function.arguments = item.arguments;
-							}
-						} else if (item?.type === 'reasoning') {
-							// 捕获完整的 reasoning 对象（包括 encrypted_content）
-							reasoningData = {
-								summary: item.summary,
-								content: item.content,
-								encrypted_content: item.encrypted_content,
-							};
-						}
-						continue;
-					} else if (eventType === 'response.content_part.added') {
-						// 内容部分添加 - 忽略
-						continue;
-					} else if (
-						eventType === 'response.reasoning_summary_text.delta' ||
-						// DeepSeek 兼容 Responses API 的思考流事件
-						eventType === 'response.reasoning_text.delta'
-					) {
-						// 推理摘要/思考流增量更新（仅用于 token 计数，不包含在响应内容中）
-						const delta = chunk.delta;
-						if (delta) {
-							yield {
-								type: 'reasoning_delta',
-								delta: delta,
-							};
-						}
-					} else if (eventType === 'response.output_text.delta') {
-						// 文本增量更新
-						const delta = chunk.delta;
-						if (delta) {
-							contentBuffer += delta;
-							yield {
-								type: 'content',
-								content: delta,
-							};
-						}
-					} else if (eventType === 'response.output_text.done') {
-						// 文本输出完成 - 忽略
-						continue;
-					} else if (eventType === 'response.content_part.done') {
-						// 内容部分完成 - 忽略
-						continue;
-					} else if (eventType === 'response.completed') {
-						// 响应完全完成 - 从 response 对象中提取 usage
-						if (chunk.response && chunk.response.usage) {
-							usageData = {
-								prompt_tokens: chunk.response.usage.input_tokens || 0,
-								completion_tokens: chunk.response.usage.output_tokens || 0,
-								total_tokens: chunk.response.usage.total_tokens || 0,
-								// OpenAI Responses API: cached_tokens in input_tokens_details (note: tokenS)
-								cached_tokens: (chunk.response.usage as any)
-									.input_tokens_details?.cached_tokens,
-							};
-						}
-						break;
-					} else if (
-						eventType === 'response.failed' ||
-						eventType === 'response.cancelled'
-					) {
-						// 响应失败或取消
-						const error = chunk.error;
-						if (error) {
-							const responseErrorMessage = error.message || 'Unknown error';
-							throw new Error(`Response failed: ${responseErrorMessage}`);
-						}
+					if (eventState.completed) {
 						break;
 					}
 				}
 
-				// 如果有工具调用，返回它们
-				if (hasToolCalls) {
-					yield {
-						type: 'tool_calls',
-						tool_calls: Object.values(toolCallsBuffer),
-					};
-				}
-
-				// Yield reasoning data if available
-				if (reasoningData) {
-					yield {
-						type: 'reasoning_data',
-						reasoning: reasoningData,
-					};
-				}
-
-				// Yield usage information if available
-				if (usageData) {
-					// Save usage to file system at API layer
-					saveUsageToFile(options.model, usageData);
-					recordChatUsage(
-						usageData,
-						telemetry.metricAttributes,
-						telemetry.span,
-					);
-
-					yield {
-						type: 'usage',
-						usage: usageData,
-					};
-				}
-
-				if (contentBuffer) {
-					recordChatContent(
-						telemetry.span,
-						'response',
-						contentBuffer,
-						telemetry.metricAttributes,
-					);
-				}
-
-				// 发送完成信号 - For Responses API, thinking content is in reasoning object, not separate thinking field
-				yield {
-					type: 'done',
-				};
+				// 统一产出工具调用、推理内容、用量与完成信号
+				yield* finalizeResponsesStream(eventState, options, telemetry);
 			},
 			{
 				abortSignal,

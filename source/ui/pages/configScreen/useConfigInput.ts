@@ -58,6 +58,8 @@ export function useConfigInput(
 		setResponsesReasoningEnabled,
 		responsesFastMode,
 		setResponsesFastMode,
+		responsesWebSocket,
+		setResponsesWebSocket,
 		maxContextTokens,
 		setMaxContextTokens,
 		maxTokens,
@@ -491,6 +493,8 @@ export function useConfigInput(
 			if (!next) setShowThinking(false);
 		} else if (currentField === 'responsesFastMode') {
 			setResponsesFastMode(!responsesFastMode);
+		} else if (currentField === 'responsesWebSocket') {
+			setResponsesWebSocket(!responsesWebSocket);
 		} else if (currentField === 'chatThinkingEnabled') {
 			const next = !state.chatThinkingEnabled;
 			state.setChatThinkingEnabled(next);

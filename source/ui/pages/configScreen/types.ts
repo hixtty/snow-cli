@@ -30,6 +30,7 @@ export type ConfigField =
 	| 'responsesReasoningMode'
 	| 'responsesVerbosity'
 	| 'responsesFastMode'
+	| 'responsesWebSocket'
 	| 'chatThinkingEnabled'
 	| 'chatReasoningEffort'
 	| 'modelGroup'
@@ -172,6 +173,7 @@ export const TOGGLE_FIELDS: ConfigField[] = [
 	'geminiThinkingEnabled',
 	'responsesReasoningEnabled',
 	'responsesFastMode',
+	'responsesWebSocket',
 	'chatThinkingEnabled',
 	'supportsVision',
 ];

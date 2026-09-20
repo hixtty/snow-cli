@@ -60,6 +60,8 @@ export interface ApiConfig {
 	geminiThinking?: GeminiThinkingConfig; // Gemini thinking configuration
 	responsesReasoning?: ResponsesReasoningConfig; // Responses API reasoning configuration
 	responsesFastMode?: boolean; // Responses API fast mode (service_tier: "priority")
+	// Responses API WebSocket 模式：用 WebSocket 长连接替代 HTTP + SSE（默认关闭）
+	responsesWebSocket?: boolean;
 	responsesVerbosity?: 'low' | 'medium' | 'high'; // Responses API text verbosity (default: medium)
 	anthropicSpeed?: 'fast' | 'standard'; // Anthropic speed parameter (optional, not sent when undefined)
 	chatThinking?: ChatThinkingConfig; // Chat API (DeepSeek) thinking configuration

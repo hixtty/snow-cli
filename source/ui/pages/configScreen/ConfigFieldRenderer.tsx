@@ -64,6 +64,7 @@ export default function ConfigFieldRenderer({field, state}: Props) {
 		responsesVerbosity,
 		setResponsesVerbosity,
 		responsesFastMode,
+		responsesWebSocket,
 		chatThinkingEnabled,
 		chatReasoningEffort,
 		supportsXHigh,
@@ -751,6 +752,24 @@ export default function ConfigFieldRenderer({field, state}: Props) {
 					<Box marginLeft={3}>
 						<Text color={theme.colors.menuSecondary}>
 							{responsesFastMode
+								? t.configScreen.enabled
+								: t.configScreen.disabled}{' '}
+							{t.configScreen.toggleHint}
+						</Text>
+					</Box>
+				</Box>
+			);
+
+		case 'responsesWebSocket':
+			return (
+				<Box key={field} flexDirection="column">
+					<Text color={activeColor}>
+						{activeIndicator}
+						{t.configScreen.responsesWebSocket}
+					</Text>
+					<Box marginLeft={3}>
+						<Text color={theme.colors.menuSecondary}>
+							{responsesWebSocket
 								? t.configScreen.enabled
 								: t.configScreen.disabled}{' '}
 							{t.configScreen.toggleHint}
